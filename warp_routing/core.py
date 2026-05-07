@@ -28,11 +28,14 @@ class CommandResult:
 class CommandRunner:
     """Small subprocess wrapper with consistent dry-run, verbose and error handling."""
 
-    def __init__(self, dry_run: bool = False, verbose: bool = False) -> None:
+    def __init__(
+        self, dry_run: bool = False, verbose: bool = False, timeout_sec: int = 20
+    ) -> None:
         """Create a runner that can either execute commands or only print them."""
 
         self.dry_run = dry_run
         self.verbose = verbose
+        self.timeout_sec = timeout_sec
 
     def run(
         self,
@@ -42,6 +45,7 @@ class CommandRunner:
         capture: bool = False,
         input_text: str | None = None,
         cwd: str | pathlib.Path | None = None,
+        timeout_sec: int | None = None,
     ) -> CommandResult:
         """Run a command and optionally capture output or raise AppError on failure."""
 
@@ -51,15 +55,25 @@ class CommandRunner:
         if self.dry_run:
             return CommandResult(cmd, 0, "", "")
 
-        completed = subprocess.run(
-            cmd,
-            check=False,
-            cwd=str(cwd) if cwd is not None else None,
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
-        )
+        effective_timeout = timeout_sec if timeout_sec is not None else self.timeout_sec
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=False,
+                cwd=str(cwd) if cwd is not None else None,
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE if capture else None,
+                stderr=subprocess.PIPE if capture else None,
+                timeout=effective_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timeout_msg = (
+                f"command timed out after {effective_timeout}s: {shlex.join(cmd)}"
+            )
+            if check:
+                raise AppError(timeout_msg) from exc
+            return CommandResult(cmd, 124, "", timeout_msg)
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
         if check and completed.returncode != 0:

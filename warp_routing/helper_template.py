@@ -5,22 +5,37 @@ from __future__ import annotations
 
 HELPER_SCRIPT = r'''#!/usr/bin/env python3
 import ipaddress
+import json
+import os
 import pathlib
 import shlex
 import subprocess
 import sys
 import time
 
+COMMAND_TIMEOUT_SEC = int(os.environ.get("WARP_ROUTING_CMD_TIMEOUT", "20"))
+
 
 def run(args, check=True, quiet=False):
     """Run a helper command, optionally suppressing expected cleanup noise."""
 
-    completed = subprocess.run(
-        [str(a) for a in args],
-        check=False,
-        stdout=subprocess.DEVNULL if quiet else None,
-        stderr=subprocess.DEVNULL if quiet else None,
-    )
+    cmd = [str(a) for a in args]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL if quiet else None,
+            stderr=subprocess.DEVNULL if quiet else None,
+            timeout=COMMAND_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        if check:
+            print(
+                f"command timed out after {COMMAND_TIMEOUT_SEC}s: {shlex.join(cmd)}",
+                file=sys.stderr,
+            )
+            raise SystemExit(124)
+        return 124
     if check and completed.returncode != 0:
         raise SystemExit(completed.returncode)
     return completed.returncode
@@ -29,7 +44,24 @@ def run(args, check=True, quiet=False):
 def stdout(args, check=True):
     """Run a helper command and return stdout for parsing."""
 
-    completed = subprocess.run([str(a) for a in args], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cmd = [str(a) for a in args]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=COMMAND_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        if check:
+            print(
+                f"command timed out after {COMMAND_TIMEOUT_SEC}s: {shlex.join(cmd)}",
+                file=sys.stderr,
+            )
+            raise SystemExit(124)
+        return ""
     if check and completed.returncode != 0:
         print(completed.stderr.strip() or completed.stdout.strip(), file=sys.stderr)
         raise SystemExit(completed.returncode)
@@ -99,17 +131,70 @@ def remove_state(env_path):
     state_path(env_path).unlink(missing_ok=True)
 
 
-def get_container_ipv4(container):
-    """Inspect Docker and return the container's current IPv4 address."""
+def inspect_container(container):
+    """Return container runtime facts needed before applying routes."""
 
-    out = stdout(["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", container]).strip()
-    for item in out.split():
+    try:
+        completed = subprocess.run(
+            ["docker", "inspect", container],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=COMMAND_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "inspect-timeout", None
+    if completed.returncode != 0:
+        return False, "missing", None
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return False, "invalid-inspect-output", None
+    if not payload:
+        return False, "missing", None
+
+    data = payload[0]
+    state = data.get("State") or {}
+    running = bool(state.get("Running"))
+    health_data = state.get("Health") or {}
+    health = str(health_data.get("Status") or "none").lower()
+
+    networks = (data.get("NetworkSettings") or {}).get("Networks") or {}
+    for network_data in networks.values():
+        item = str((network_data or {}).get("IPAddress") or "").strip()
+        if not item:
+            continue
         try:
             ipaddress.IPv4Address(item)
-            return item
+            return running, health, item
         except ValueError:
             continue
-    print(f"container has no IPv4 address: {container}", file=sys.stderr)
+    return running, health, None
+
+
+def wait_for_container_ipv4(container, timeout=120, interval=2, require_healthy=False):
+    """Wait until container is running and has IPv4 (optionally healthy)."""
+
+    attempts = max(1, timeout // max(1, interval))
+    last_reason = "missing"
+    for _ in range(attempts):
+        running, health, ip = inspect_container(container)
+        if not running:
+            last_reason = "not-running"
+        elif require_healthy and health not in {"healthy", "none"}:
+            last_reason = f"health-{health}"
+        elif ip:
+            return ip
+        else:
+            last_reason = "no-ipv4"
+        time.sleep(interval)
+
+    print(
+        f"container not ready: {container} ({last_reason}) after {timeout}s",
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 
 
@@ -180,7 +265,15 @@ def up(env, env_path):
     prio = env["PRIO"]
     chain = env["CHAIN"]
     container = env["CONTAINER_NAME"]
-    container_ip = get_container_ipv4(container)
+    wait_timeout = int(env.get("CONTAINER_WAIT_TIMEOUT", "60"))
+    wait_interval = int(env.get("CONTAINER_WAIT_INTERVAL", "3"))
+    require_healthy = env.get("CONTAINER_REQUIRE_HEALTHY", "0").lower() in {"1", "true", "yes", "on"}
+    container_ip = wait_for_container_ipv4(
+        container,
+        timeout=wait_timeout,
+        interval=wait_interval,
+        require_healthy=require_healthy,
+    )
     src = f"{container_ip}/32"
     warp_if = env["WARP_IF"]
     wait_for_iface(warp_if)
@@ -262,10 +355,16 @@ SYSTEMD_UNIT_TEXT = """[Unit]
 Description=Route Docker container %i egress through host WARP
 After=network-online.target docker.service
 Wants=network-online.target docker.service
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=90s
+Restart=on-failure
+RestartSec=5s
 ExecStart=/usr/local/sbin/warp-container-routing-helper up /etc/warp-container-routing/%i.env
 ExecReload=/usr/local/sbin/warp-container-routing-helper reload /etc/warp-container-routing/%i.env
 ExecStop=/usr/local/sbin/warp-container-routing-helper down /etc/warp-container-routing/%i.env

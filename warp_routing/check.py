@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import shlex
 
-from .constants import CONFIG_DIR
+from .constants import APP_NAME, CONFIG_DIR
+from .console import green, yellow
 from .core import AppError, CommandRunner, require_commands
 from .docker import DockerInspector
 from .network import NetworkDetector
 from .utils import find_env_for_container, parse_env_file, state_file_for_env
-
 
 class RouteChecker:
     """Validate that a configured route is present and can reach the internet."""
@@ -26,7 +26,7 @@ class RouteChecker:
     def check_all(self, external_url: str) -> int:
         """Run route checks for every configured container and aggregate the status."""
 
-        require_commands(["docker", "ip", "iptables"])
+        require_commands(["docker", "ip", "iptables", "systemctl"])
         if not CONFIG_DIR.exists():
             print("No configured container routes.")
             return 0
@@ -44,8 +44,8 @@ class RouteChecker:
                 print()
             if not container:
                 print(f"env: {env_file}")
-                print("result: failed")
-                print("  - CONTAINER_NAME is missing")
+                print(yellow("result: failed"))
+                print(yellow("  - CONTAINER_NAME is missing"))
                 exit_code = 2
                 continue
             print(f"== {container} ==")
@@ -56,7 +56,7 @@ class RouteChecker:
     def check(self, container: str, external_url: str) -> int:
         """Run all route checks and return a process-style status code."""
 
-        require_commands(["docker", "ip", "iptables"])
+        require_commands(["docker", "ip", "iptables", "systemctl"])
         failures: list[str] = []
         warnings: list[str] = []
 
@@ -77,6 +77,7 @@ class RouteChecker:
         else:
             print(f"env: {env_file}")
             data = parse_env_file(env_file)
+            self._check_service_status(env_file, failures)
             state_file = state_file_for_env(env_file)
             if state_file.exists():
                 state = parse_env_file(state_file)
@@ -88,25 +89,25 @@ class RouteChecker:
             if not warp_if or not self.detector.have_iface(warp_if):
                 failures.append(f"WARP interface is missing: {warp_if or 'unknown'}")
             else:
-                print(f"warp interface: {warp_if} (present)")
+                print(green(f"warp interface: {warp_if} (present)"))
             self._check_ip_rule(data, failures)
             self._check_route_table(data, failures)
             self._check_iptables(data, failures)
             self._check_external_ip(container, external_url, warnings)
 
         if failures:
-            print("result: failed")
+            print(yellow("result: failed"))
             for item in failures:
-                print(f"  - {item}")
+                print(yellow(f"  - {item}"))
             for item in warnings:
-                print(f"  - warning: {item}")
+                print(yellow(f"  - warning: {item}"))
             return 2
         if warnings:
-            print("result: warning")
+            print(yellow("result: warning"))
             for item in warnings:
-                print(f"  - {item}")
+                print(yellow(f"  - {item}"))
             return 1
-        print("result: ok")
+        print(green("result: ok"))
         return 0
 
     def _check_ip_rule(self, data: dict[str, str], failures: list[str]) -> None:
@@ -123,7 +124,7 @@ class RouteChecker:
             for line in out.splitlines()
         )
         if found:
-            print("ip rule: present")
+            print(green("ip rule: present"))
         else:
             failures.append("ip rule for container mark is missing")
 
@@ -134,7 +135,7 @@ class RouteChecker:
             ["ip", "route", "show", "table", data.get("TABLE", "")], check=False
         )
         if f"default dev {data.get('WARP_IF', '')}" in out:
-            print("routing table: default route via WARP is present")
+            print(green("routing table: default route via WARP is present"))
         else:
             failures.append("routing table default route via WARP is missing")
 
@@ -147,13 +148,28 @@ class RouteChecker:
         mangle = self.runner.stdout(["iptables", "-t", "mangle", "-S"], check=False)
         nat = self.runner.stdout(["iptables", "-t", "nat", "-S"], check=False)
         if chain and chain in mangle and src in mangle:
-            print("iptables mangle: present")
+            print(green("iptables mangle: present"))
         else:
             failures.append("iptables mangle chain/rules are missing")
         if src in nat and warp_if in nat and "MASQUERADE" in nat:
-            print("iptables nat: MASQUERADE is present")
+            print(green("iptables nat: MASQUERADE is present"))
         else:
             failures.append("iptables NAT MASQUERADE rule is missing")
+
+    def _check_service_status(
+        self, env_file, failures: list[str]
+    ) -> None:
+        """Verify the per-container routing systemd service is active."""
+
+        service = f"{APP_NAME}@{env_file.stem}.service"
+        result = self.runner.run(
+            ["systemctl", "is-active", service], check=False, capture=True
+        )
+        status = (result.stdout or result.stderr).strip() or "unknown"
+        line = f"service: {service} ({status})"
+        print(green(line) if status == "active" else yellow(line))
+        if status != "active":
+            failures.append(f"systemd service is not active: {status}")
 
     def _check_external_ip(
         self, container: str, external_url: str, warnings: list[str]

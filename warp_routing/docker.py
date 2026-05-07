@@ -89,15 +89,23 @@ class DockerInspector:
         """Return running Docker containers for interactive selection."""
 
         result = self.runner.run(
-            ["docker", "ps", "--format", "{{.Names}}\t{{.ID}}\t{{.Image}}"],
+            ["docker", "ps", "--format", "{{json .}}"],
             check=False,
             capture=True,
         )
         containers: list[dict[str, str]] = []
         for line in result.stdout.splitlines():
-            name, sep, rest = line.partition("\t")
-            if not sep:
+            line = line.strip()
+            if not line:
                 continue
-            container_id, _, image = rest.partition("\t")
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            name = str(item.get("Names") or "")
+            container_id = str(item.get("ID") or "")
+            image = str(item.get("Image") or "")
+            if not name:
+                continue
             containers.append({"name": name, "id": container_id, "image": image})
         return containers

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Не найден .venv. Создай окружение и установи pytest:" >&2
+  echo "  python3 -m venv .venv && source .venv/bin/activate && python -m pip install -U pip pytest" >&2
+  exit 1
+fi
+
+TEST_KIND="${1:-}"
+PYTEST_INI="$ROOT_DIR/pytest.ini"
+
+load_markers() {
+  local in_markers=0
+  local line trimmed marker
+
+  if [[ ! -f "$PYTEST_INI" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^markers[[:space:]]*= ]]; then
+      in_markers=1
+      continue
+    fi
+    if [[ $in_markers -eq 1 ]]; then
+      if [[ "$line" =~ ^[[:space:]]+([^:#[:space:]]+) ]]; then
+        trimmed="${BASH_REMATCH[1]}"
+        marker="${trimmed%%:*}"
+        if [[ -n "$marker" ]]; then
+          MARKERS+=("$marker")
+        fi
+        continue
+      fi
+      if [[ "$line" =~ ^[^[:space:]] ]]; then
+        break
+      fi
+    fi
+  done <"$PYTEST_INI"
+}
+
+is_known_marker() {
+  local candidate="$1"
+  local marker
+  for marker in "${MARKERS[@]}"; do
+    if [[ "$marker" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_usage() {
+  local joined=""
+  local marker
+
+  for marker in "${MARKERS[@]}"; do
+    if [[ -n "$joined" ]]; then
+      joined="$joined | "
+    fi
+    joined+="$marker"
+  done
+
+  if [[ -n "$joined" ]]; then
+    echo "Типы: all | $joined" >&2
+  else
+    echo "Типы: all" >&2
+  fi
+}
+
+declare -a MARKERS=()
+load_markers
+
+case "$TEST_KIND" in
+  all)
+    exec "$PYTHON_BIN" -m pytest -q -s
+    ;;
+  "")
+    echo "Использование: ./test <тип>" >&2
+    print_usage
+    exit 2
+    ;;
+  *)
+    if is_known_marker "$TEST_KIND"; then
+      exec "$PYTHON_BIN" -m pytest -q -s -m "$TEST_KIND"
+    fi
+    echo "Неизвестный тип теста: $TEST_KIND" >&2
+    print_usage
+    exit 2
+    ;;
+esac
